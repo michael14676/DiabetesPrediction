@@ -1,0 +1,937 @@
+---
+title: "Adv Statistical Learning Project 1: Predicting the Onset of Diabetes"
+author: "Christopher Mao and Michael De La Rosa"
+date: "2025-03-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# set seed for reproducibility
+set.seed(44)
+
+# Load required libraries
+library(ggplot2)
+library(dplyr)
+library(corrplot)
+library(car)
+library(mice)
+library(VIM)
+library(caret)
+library(pROC)
+library(MASS)
+library(randomForest)
+library(glmnet)
+library(tidyr)
+library(class)
+library(splines)     # For splines in logistic regression
+library(mgcv)        # For GAMs
+library(gbm)         # For boosting
+library(effects)
+
+
+# Load and inspect dataset
+diabetes <- read.csv("diabetes.csv")
+
+# Replace invalid zeros with NA
+incorrect.cols <- c('Glucose','BloodPressure','SkinThickness','Insulin','BMI') # has the messed up columns
+diabetes.corrected <- diabetes
+for (col in incorrect.cols) {
+  diabetes.corrected[[col]][diabetes.corrected[[col]] == 0] <- NaN
+}
+
+# Impute missing data with MICE
+set.seed(0)
+diabetes.imputed <- mice(diabetes.corrected, m=5, method='pmm')
+diabetes.complete <- complete(diabetes.imputed, 1) 
+
+# Identify and remove influential points using Cook's Distance
+model <- glm(Outcome ~ ., data = diabetes.complete, family = binomial)
+cooks <- cooks.distance(model)
+thresh <- 4 / nrow(diabetes.complete)
+influential_idx <- which(cooks > thresh)
+diabetes.clean <- diabetes.complete[-influential_idx, ]
+
+# Center and scale
+scaled <- scale(diabetes.clean[,-9])
+diabetes.complete <- as.data.frame(scaled)
+diabetes.complete$Outcome <- as.factor(diabetes.clean$Outcome)
+
+#summary(diabetes.scaled)
+```
+
+## Setup for 10 Fold Cross Validation
+
+```{r}
+k = 10
+fold.indices <- createDataPartition(diabetes.complete$Outcome, times = k, p = 1/k, list = TRUE) # list of 10 lists of indices for testing
+```
+
+## Logistic regression
+```{r}
+logistic.full.model <- function(test.index) {
+  train <- as.data.frame(diabetes.complete[-test.index, ])
+  test  <- as.data.frame(diabetes.complete[test.index, ])
+  
+  train$Outcome <- factor(train$Outcome, levels = c(0, 1))
+  test$Outcome <- factor(test$Outcome, levels = c(0, 1))
+  
+  # Fit full logistic regression model
+  logit_model <- glm(Outcome ~ ., data = train, family = binomial)
+  
+  # Predict probabilities
+  pred.prob <- predict(logit_model, newdata = test, type = "response")
+  y.pred <- ifelse(pred.prob > 0.5, "1", "0")
+  y.pred <- factor(y.pred, levels = c(0, 1))
+  
+  # Evaluate
+  cm <- confusionMatrix(y.pred, reference = test$Outcome, positive = "1", mode = "everything")
+  roc.obj <- roc(test$Outcome, pred.prob)
+  
+  return(list(cm = cm, roc.obj = roc.obj, model = logit_model))
+}
+logit.metrics <- lapply(fold.indices, logistic.full.model)
+
+# Results
+get_avg_roc <- function(model.metrics) {
+  all_probs <- unlist(lapply(model.metrics, function(x) x$roc.obj$predictor))
+  all_labels <- unlist(lapply(model.metrics, function(x) x$roc.obj$response))
+  roc_obj <- roc(all_labels, all_probs)
+  return(roc_obj)
+}
+
+
+roc_logit <- get_avg_roc(logit.metrics)
+plot(roc_logit, col = "navy", lwd = 2, main = "Logistic Regression ROC")
+print(auc(roc_logit))
+
+
+```
+
+
+### Stepwise Logistic Regression
+```{r}
+logistic.stepwise.model <- function(test.index) {
+  train <- as.data.frame(diabetes.complete[-test.index, ])
+  test  <- as.data.frame(diabetes.complete[test.index, ])
+  
+  train$Outcome <- factor(train$Outcome, levels = c(0, 1))
+  test$Outcome <- factor(test$Outcome, levels = c(0, 1))
+  
+  # Fit null and full models
+  null_model <- glm(Outcome ~ 1, data = train, family = binomial)
+  full_model <- glm(Outcome ~ ., data = train, family = binomial)
+  
+  # Perform stepwise selection based on AIC
+  step_model <- stepAIC(null_model, scope = list(lower = null_model, upper = full_model),
+                        direction = "both", trace = 0)
+  
+  # Predict probabilities
+  pred.prob <- predict(step_model, newdata = test, type = "response")
+  y.pred <- ifelse(pred.prob > 0.5, "1", "0")
+  y.pred <- factor(y.pred, levels = c(0, 1))
+  
+  # Evaluate
+  cm <- confusionMatrix(y.pred, reference = test$Outcome, positive = "1", mode = "everything")
+  roc.obj <- roc(test$Outcome, pred.prob)
+  
+  return(list(cm = cm, roc.obj = roc.obj, model = step_model))
+}
+stepwise.metrics <- lapply(fold.indices, logistic.stepwise.model)
+
+roc_stepwise <- get_avg_roc(stepwise.metrics)
+plot(roc_stepwise, col = "darkorange", lwd = 2, main = "Stepwise Logistic Regression ROC")
+print(auc(roc_stepwise))
+```
+
+
+
+### GAMS
+```{r gam, warning=F}
+gam.logistic <- function(test.index) {
+  train <- diabetes.complete[-test.index, ]
+  test <- diabetes.complete[test.index, ]
+  
+  # Fit GAM logistic regression
+  gam.model <- gam(
+    Outcome ~ s(Pregnancies) + s(Glucose) + s(BloodPressure) + s(SkinThickness) +
+               s(Insulin) + s(BMI) + s(DiabetesPedigreeFunction) + s(Age),
+    family = binomial,
+    data = train
+  )
+  
+  y.prob <- predict(gam.model, newdata = test, type = "response")
+  y.pred <- ifelse(y.prob > 0.5, "1", "0")
+  
+  y.pred <- factor(y.pred, levels = c(0, 1))
+  test$Outcome <- factor(test$Outcome, levels = c(0, 1))
+  
+  cm <- confusionMatrix(y.pred, reference = test$Outcome, positive = '1', mode = 'everything')
+  roc.obj <- roc(test$Outcome, y.prob)
+  print(summary(gam.model))
+  return(list(cm = cm, roc.obj = roc.obj, formula = formula(gam.model)))
+}
+
+
+gam.metrics <- lapply(fold.indices, gam.logistic)
+
+# Results
+roc_gam <- get_avg_roc(gam.metrics)
+plot(roc_gam)
+print(auc(roc_gam))
+
+```
+
+```{r}
+gam.model <- gam(
+    Outcome ~ s(Pregnancies) + s(Glucose) + s(BloodPressure) + s(SkinThickness) +
+               s(Insulin) + s(BMI) + s(DiabetesPedigreeFunction) + s(Age),
+    family = binomial,
+    data = diabetes.complete
+  )
+
+par(mfrow=c(2,2))
+plot(gam.model, pages = 2, se = TRUE, shade = TRUE, rug = TRUE, scale = 0)
+summary(gam.model)
+```
+
+
+```{r gam_mixed}
+gam.mixed <- function(test.index) {
+  train <- diabetes.complete[-test.index, ]
+  test <- diabetes.complete[test.index, ]
+  
+  # Fit GAM logistic regression
+  gam.model <- gam(
+    Outcome ~ Pregnancies + s(Glucose) + BloodPressure + SkinThickness +
+               Insulin + s(BMI) + s(DiabetesPedigreeFunction) + s(Age),
+    family = binomial,
+    data = train
+  )
+  
+  y.prob <- predict(gam.model, newdata = test, type = "response")
+  y.pred <- ifelse(y.prob > 0.5, "1", "0")
+  
+  y.pred <- factor(y.pred, levels = c(0, 1))
+  test$Outcome <- factor(test$Outcome, levels = c(0, 1))
+  
+  cm <- confusionMatrix(y.pred, reference = test$Outcome, positive = '1', mode = 'everything')
+  roc.obj <- roc(test$Outcome, y.prob)
+  print(summary(gam.model))
+  return(list(cm = cm, roc.obj = roc.obj, formula = formula(gam.model)))
+}
+
+
+mixed.metrics <- lapply(fold.indices, gam.mixed)
+
+# Results
+roc_mixed <- get_avg_roc(mixed.metrics)
+plot(roc_mixed)
+print(auc(roc_mixed))
+```
+
+```{r gam_interact}
+gam.glucose.age.interaction <- function(test.index) {
+  train <- diabetes.complete[-test.index, ]
+  test <- diabetes.complete[test.index, ]
+  
+  gam.model <- gam(
+    Outcome ~ Pregnancies + BloodPressure + SkinThickness +
+               Insulin + s(BMI) + s(DiabetesPedigreeFunction) + ti(BMI, DiabetesPedigreeFunction) +
+              s(Glucose) + s(Age) + ti(Glucose, Age), # interaction terms
+    family = binomial,
+    data = train,
+    method = "REML"
+  )
+  
+  y.prob <- predict(gam.model, newdata = test, type = "response")
+  y.pred <- ifelse(y.prob > 0.5, "1", "0")
+  
+  y.pred <- factor(y.pred, levels = c(0, 1))
+  test$Outcome <- factor(test$Outcome, levels = c(0, 1))
+  
+  cm <- confusionMatrix(y.pred, reference = test$Outcome, positive = "1", mode = "everything")
+  roc.obj <- roc(test$Outcome, y.prob)
+  
+  return(list(cm = cm, roc.obj = roc.obj, formula = formula(gam.model)))
+}
+interactions.metrics <- lapply(fold.indices, gam.glucose.age.interaction)
+
+# Results
+roc_interact <- get_avg_roc(interactions.metrics)
+plot(roc_interact)
+print(auc(roc_interact))
+```
+
+### Splines
+```{r bspline, warning=F}
+# for one knot
+DEG_FREEDOM <- 4  # real value is this + 1
+
+bspline.logistic <- function(test.index) {
+  train <- diabetes.complete[-test.index, ]
+  test <- diabetes.complete[test.index, ]
+  
+  bs.model <- glm(
+    Outcome ~ bs(Pregnancies, df = DEG_FREEDOM, degree = 3) +
+              bs(Glucose, df = DEG_FREEDOM, degree = 3) +
+              bs(BloodPressure, df = DEG_FREEDOM, degree = 3) +
+              bs(SkinThickness, df = DEG_FREEDOM, degree = 3) +
+              bs(Insulin, df = DEG_FREEDOM, degree = 3) +
+              bs(BMI, df = DEG_FREEDOM, degree = 3) +
+              bs(DiabetesPedigreeFunction, df = DEG_FREEDOM, degree = 3) +
+              bs(Age, df = DEG_FREEDOM, degree = 3),
+    family = binomial,
+    data = train
+  )
+  
+  y.prob <- predict(bs.model, newdata = test, type = "response")
+  y.pred <- ifelse(y.prob > 0.5, "1", "0")
+  
+  y.pred <- factor(y.pred, levels = c(0, 1))
+  test$Outcome <- factor(test$Outcome, levels = c(0, 1))
+  
+  cm <- confusionMatrix(y.pred, reference = test$Outcome, positive = "1", mode = "everything")
+  roc.obj <- roc(test$Outcome, y.prob)
+  
+  return(list(cm = cm, roc.obj = roc.obj, formula = formula(bs.model)))
+}
+
+spline.metrics <- lapply(fold.indices, bspline.logistic)
+
+# Results
+roc_spline <- get_avg_roc(spline.metrics)
+plot(roc_spline)
+print(auc(roc_spline))
+```
+
+
+```{r bspline, warning=F}
+# for two knot
+DEG_FREEDOM <- 5  # real value is this + 1
+
+bspline2.logistic <- function(test.index) {
+  train <- diabetes.complete[-test.index, ]
+  test <- diabetes.complete[test.index, ]
+  
+  bs.model <- glm(
+    Outcome ~ bs(Pregnancies, df = DEG_FREEDOM, degree = 3) +
+              bs(Glucose, df = DEG_FREEDOM, degree = 3) +
+              bs(BloodPressure, df = DEG_FREEDOM, degree = 3) +
+              bs(SkinThickness, df = DEG_FREEDOM, degree = 3) +
+              bs(Insulin, df = DEG_FREEDOM, degree = 3) +
+              bs(BMI, df = DEG_FREEDOM, degree = 3) +
+              bs(DiabetesPedigreeFunction, df = DEG_FREEDOM, degree = 3) +
+              bs(Age, df = DEG_FREEDOM, degree = 3),
+    family = binomial,
+    data = train
+  )
+  
+  y.prob <- predict(bs.model, newdata = test, type = "response")
+  y.pred <- ifelse(y.prob > 0.5, "1", "0")
+  
+  y.pred <- factor(y.pred, levels = c(0, 1))
+  test$Outcome <- factor(test$Outcome, levels = c(0, 1))
+  
+  cm <- confusionMatrix(y.pred, reference = test$Outcome, positive = "1", mode = "everything")
+  roc.obj <- roc(test$Outcome, y.prob)
+  
+  return(list(cm = cm, roc.obj = roc.obj, formula = formula(bs.model)))
+}
+
+spline2.metrics <- lapply(fold.indices, bspline2.logistic)
+
+# Results
+roc_spline2 <- get_avg_roc(spline2.metrics)
+plot(roc_spline)
+print(auc(roc_spline))
+```
+
+```{r}
+# library(ggplot2)
+# library(splines)
+# library(patchwork)
+# 
+# predictors <- c("Pregnancies", "Glucose", "BloodPressure", "SkinThickness", 
+#                 "Insulin", "BMI", "DiabetesPedigreeFunction", "Age")
+# 
+# base_profile <- as.data.frame(lapply(diabetes.complete[, predictors], median, na.rm = TRUE))
+# plot_list <- list()
+# 
+# # Get predicted probabilities for all original patients
+# diabetes.complete$pred_prob <- predict(bs.model, newdata = diabetes.complete, type = "response")
+# 
+# for (var in predictors) {
+#   x_seq <- seq(min(diabetes.complete[[var]], na.rm = TRUE),
+#                max(diabetes.complete[[var]], na.rm = TRUE),
+#                length.out = 100)
+#   
+#   new_data <- base_profile[rep(1, 100), ]
+#   new_data[[var]] <- x_seq
+#   
+#   pred_probs <- predict(bs.model, newdata = new_data, type = "response")
+#   df_plot <- data.frame(x = x_seq, prob = pred_probs)
+#   
+#   p <- ggplot(df_plot, aes(x = x, y = prob)) +
+#     geom_line(color = "steelblue", linewidth = 1) +
+#     labs(title = paste("Effect of", var), x = var, y = "Predicted Probability") +
+#     theme_minimal()
+#   
+#   plot_list[[var]] <- p
+# }
+# 
+# # Display in 2x2 grid pages
+# for (i in seq(1, length(plot_list), by = 4)) {
+#   grid_plot <- wrap_plots(plot_list[i:min(i+3, length(plot_list))], ncol = 2)
+#   print(grid_plot)
+# }
+```
+
+## QDA
+```{r}
+qda.model <- function(test.index) {
+  train <- as.data.frame(diabetes.complete[-test.index, ])
+  test  <- as.data.frame(diabetes.complete[test.index, ])
+  
+  train$Outcome <- factor(train$Outcome, levels = c(0, 1))
+  test$Outcome <- factor(test$Outcome, levels = c(0, 1))
+  
+  # Fit QDA model
+  qda_fit <- qda(Outcome ~ ., data = train)
+  
+  # Predict posterior probabilities
+  pred <- predict(qda_fit, newdata = test)
+  pred.prob <- pred$posterior[, "1"]
+  
+  # Convert probabilities to class labels
+  y.pred <- ifelse(pred.prob > 0.5, "1", "0")
+  y.pred <- factor(y.pred, levels = c(0, 1))
+  
+  # Evaluate
+  cm <- confusionMatrix(y.pred, reference = test$Outcome, positive = "1", mode = "everything")
+  roc.obj <- roc(test$Outcome, pred.prob)
+  
+  return(list(cm = cm, roc.obj = roc.obj, model = qda_fit))
+}
+qda.metrics <- lapply(fold.indices, qda.model)
+
+roc_qda <- get_avg_roc(qda.metrics)
+plot(roc_qda, col = "firebrick", lwd = 2, main = "QDA ROC Curve")
+print(auc(roc_qda))
+```
+
+## KNN
+```{r}
+# Extract predictors and labels
+X <- diabetes.complete[, -which(names(diabetes.complete) == "Outcome")]
+y <- factor(diabetes.complete$Outcome, levels = c(0, 1), labels = c("No", "Yes"))
+
+
+# Center and scale
+preproc <- preProcess(X, method = c("center", "scale"))
+X_scaled <- predict(preproc, X)
+
+# Combine into final dataset
+knn_data <- data.frame(X_scaled, Outcome = y)
+
+# Custom AUROC summary function
+aurocSummary <- function(data, lev = NULL, model = NULL) {
+  roc_obj <- roc(response = data$obs, predictor = as.numeric(data$pred), levels = rev(levels(data$obs)))
+  auc_val <- as.numeric(auc(roc_obj))
+  out <- c(AUC = auc_val)
+  return(out)
+}
+
+# Train KNN model with 10-fold CV, tuning k = 1:20
+set.seed(0)
+train_control <- trainControl(
+  method = "cv",
+  number = 10,
+  summaryFunction = aurocSummary,
+  classProbs = TRUE,
+  savePredictions = TRUE
+)
+
+knn_tuned <- train(Outcome ~ ., data = knn_data,
+                   method = "knn",
+                   trControl = train_control,
+                   tuneGrid = data.frame(k = 1:20),
+                   metric = "AUC")
+
+# Plot CV results
+plot(knn_tuned)
+
+# Get best k based on AUROC
+results <- knn_tuned$results
+best_k_auc <- results$k[which.max(results$AUC)]
+cat("Best k using AUROC:", best_k_auc, "\n")
+
+
+# Define fold-wise evaluation function
+knn.model <- function(test.index, k) {
+  train <- diabetes.complete[-test.index, ]
+  test  <- diabetes.complete[test.index, ]
+  
+  X_train <- train[, -which(names(train) == "Outcome")]
+  y_train <- factor(train$Outcome, levels = c(0, 1))
+  X_test <- test[, -which(names(test) == "Outcome")]
+  y_test <- factor(test$Outcome, levels = c(0, 1))
+  
+  # Scale data using training means/SD
+  preproc <- preProcess(X_train, method = c("center", "scale"))
+  X_train_scaled <- predict(preproc, X_train)
+  X_test_scaled  <- predict(preproc, X_test)
+  
+  y_pred <- knn(train = X_train_scaled, test = X_test_scaled, cl = y_train, k = k)
+  y_prob <- as.numeric(as.character(y_pred))  # Convert to numeric for ROC
+  y_prob <- ifelse(y_prob == 1, 1, 0)         # ensure 0/1 only
+  
+  y_pred_factor <- factor(y_prob, levels = c(0, 1))
+  cm <- confusionMatrix(y_pred_factor, y_test, positive = "1", mode = "everything")
+  roc.obj <- roc(response = y_test, predictor = y_prob)
+  
+  return(list(cm = cm, roc.obj = roc.obj, k = k))
+}
+
+# Evaluate best model across folds
+knn.metrics <- lapply(fold.indices, function(idx) knn.model(idx, k = best_k_auc))
+
+# Average ROC curve
+roc_knn <- get_avg_roc(knn.metrics)
+
+# Plot and print AUC
+plot(roc_knn, col = "darkblue", lwd = 2, main = paste("KNN ROC (k =", best_k_auc, ")"))
+print(auc(roc_knn))
+
+```
+
+## Decision Trees
+
+```{r}
+library(rpart)
+library(caret)
+library(pROC)
+
+decision.tree.model <- function(test.index) {
+  train <- as.data.frame(diabetes.complete[-test.index, ])
+  test  <- as.data.frame(diabetes.complete[test.index, ])
+  
+  train$Outcome <- factor(train$Outcome, levels = c(0, 1))
+  test$Outcome <- factor(test$Outcome, levels = c(0, 1))
+  
+  # Fit the full tree with small cp (no early stopping)
+  full.tree <- rpart(
+    Outcome ~ ., 
+    data = train, 
+    method = "class", 
+    control = rpart.control(cp = 0.001)  # grow a big tree first
+  )
+  
+  # Get best cp from the cross-validated error in cptable
+  best.cp <- full.tree$cptable[which.min(full.tree$cptable[, "xerror"]), "CP"]
+  
+  # Prune the tree
+  pruned.tree <- prune(full.tree, cp = best.cp)
+  
+  # Predict probabilities
+  pred.prob <- predict(pruned.tree, newdata = test, type = "prob")[, "1"]
+  y.pred <- ifelse(pred.prob > 0.5, "1", "0")
+  y.pred <- factor(y.pred, levels = c(0, 1))
+  
+  cm <- confusionMatrix(y.pred, reference = test$Outcome, positive = "1", mode = "everything")
+  roc.obj <- roc(test$Outcome, pred.prob)
+  
+  return(list(cm = cm, roc.obj = roc.obj, model = pruned.tree, best.cp = best.cp))
+}
+
+tree.metrics <- lapply(fold.indices, decision.tree.model)
+
+# Results
+roc_tree <- get_avg_roc(tree.metrics)
+plot(roc_tree)
+print(auc(roc_tree))
+```
+
+```{r}
+library(rpart.plot)
+
+full.tree <- rpart(
+    Outcome ~ ., 
+    data = diabetes.complete, 
+    method = "class", 
+    control = rpart.control(cp = 0.001)  # grow a big tree first
+  )
+  
+rpart.plot(full.tree, box.palette = "auto", nn = TRUE)
+
+# Step 2: Find cp with lowest cross-validated error
+best.cp <- full.tree$cptable[which.min(full.tree$cptable[,"xerror"]), "CP"]
+
+# Step 3: Prune the tree
+pruned.tree <- prune(full.tree, cp = best.cp)
+
+
+rpart.plot(pruned.tree, box.palette = "auto", nn = TRUE)
+
+```
+## Random Forest
+
+```{r}
+random.forest.model <- function(test.index) {
+  train <- as.data.frame(diabetes.complete[-test.index, ])
+  test  <- as.data.frame(diabetes.complete[test.index, ])
+  
+  train$Outcome <- factor(train$Outcome, levels = c(0, 1))
+  test$Outcome <- factor(test$Outcome, levels = c(0, 1))
+  
+  # Train random forest
+  rf_model <- randomForest(Outcome ~ ., data = train, ntree = 500, importance = TRUE)
+  
+  # Predict probabilities for class 1
+  pred.prob <- predict(rf_model, newdata = test, type = "prob")[, "1"]
+  y.pred <- ifelse(pred.prob > 0.5, "1", "0")
+  y.pred <- factor(y.pred, levels = c(0, 1))
+  
+  # Evaluate
+  cm <- confusionMatrix(y.pred, reference = test$Outcome, positive = "1", mode = "everything")
+  roc.obj <- roc(test$Outcome, pred.prob)
+  
+  return(list(cm = cm, roc.obj = roc.obj, model = pruned.tree, best.cp = best.cp))
+}
+
+rf.metrics <- lapply(fold.indices, random.forest.model)
+
+# Results
+roc_rf <- get_avg_roc(rf.metrics)
+plot(roc_rf)
+print(auc(roc_rf))
+```
+## Final Combined ROC
+
+```{r}
+plot(roc_logit, col = "navy", lwd = 2, main = "Average ROC Curves by Model")
+
+plot(roc_stepwise, add = TRUE, col = "dodgerblue", lwd = 2)
+plot(roc_gam,      add = TRUE, col = "blue", lwd = 2)
+plot(roc_mixed,    add = TRUE, col = "darkgreen", lwd = 2)
+plot(roc_interact, add = TRUE, col = "purple", lwd = 2)
+plot(roc_spline,   add = TRUE, col = "orange", lwd = 2)
+plot(roc_spline2,  add = TRUE, col = "darkorange", lwd = 2)
+plot(roc_qda,      add = TRUE, col = "brown", lwd = 2)
+plot(roc_knn,      add = TRUE, col = "darkblue", lwd = 2)
+plot(roc_tree,     add = TRUE, col = "red", lwd = 2)
+plot(roc_rf,       add = TRUE, col = "forestgreen", lwd = 2)
+
+legend("bottomright",
+       legend = c(
+         paste("Logistic (Full)       AUC =", round(auc(roc_logit), 3)),
+         paste("Logistic (Stepwise)   AUC =", round(auc(roc_stepwise), 3)),
+         paste("Logistic (1 knot spline)  AUC =", round(auc(roc_spline), 3)),
+         paste("Logistic (2 knot spline)  AUC =", round(auc(roc_spline2), 3)),
+         paste("GAM (Full)            AUC =", round(auc(roc_gam), 3)),
+         paste("GAM (Mixed)           AUC =", round(auc(roc_mixed), 3)),
+         paste("GAM (Interact)        AUC =", round(auc(roc_interact), 3)),
+         paste("QDA                   AUC =", round(auc(roc_qda), 3)),
+         paste("KNN                   AUC =", round(auc(roc_knn), 3)),
+         paste("Decision Tree         AUC =", round(auc(roc_tree), 3)),
+         paste("Random Forest         AUC =", round(auc(roc_rf), 3))
+       ),
+       col = c("navy", "dodgerblue", "blue", "darkgreen", "purple",
+               "orange", "darkorange", "brown", "darkblue", "red", "forestgreen"),
+       lwd = 2,
+       cex = 0.7)
+
+```
+
+## Summary statistics
+```{r}
+extract_metrics <- function(model.metrics) {
+  # Initialize vectors
+  accuracy_list <- c()
+  auc_list <- c()
+  f1_list <- c()
+  
+  # Loop through each fold's result
+  for (i in seq_along(model.metrics)) {
+    cm <- model.metrics[[i]]$cm
+    roc.obj <- model.metrics[[i]]$roc.obj
+    
+    accuracy_list[i] <- cm$overall["Accuracy"]
+    f1_list[i] <- cm$byClass["F1"]
+    auc_list[i] <- pROC::auc(roc.obj)
+  }
+  
+  # Return a summary data frame with mean and SD
+  summary_df <- data.frame(
+    Accuracy = mean(accuracy_list, na.rm = TRUE),
+    Accuracy_SD = sd(accuracy_list, na.rm = TRUE),
+    AUC = mean(auc_list, na.rm = TRUE),
+    AUC_SD = sd(auc_list, na.rm = TRUE),
+    F1 = mean(f1_list, na.rm = TRUE),
+    F1_SD = sd(f1_list, na.rm = TRUE)
+  )
+  
+  return(summary_df)
+}
+
+# List of all model metric objects and their names (updated)
+model_list <- list(
+  "Logistic (Full)" = logit.metrics,
+  "Logistic (Stepwise)" = stepwise.metrics,
+  "Logistic (1 knot spline)" = spline.metrics,
+  "Logistic (2 knot spline)" = spline2.metrics,
+  "GAM (All Smooth)" = gam.metrics,
+  "GAM (Mixed)" = mixed.metrics,
+  "GAM (Interaction)" = interactions.metrics,
+  "QDA" = qda.metrics,
+  "k-NN" = knn.metrics,
+  "Decision Tree" = tree.metrics,
+  "Random Forest" = rf.metrics
+)
+
+# Apply extract_metrics to each model and bind results
+combined_metrics <- do.call(rbind, lapply(names(model_list), function(name) {
+  df <- extract_metrics(model_list[[name]])
+  df$Model <- name
+  return(df)
+}))
+
+# Reorder columns so Model is first
+combined_metrics <- combined_metrics[, c("Model", setdiff(names(combined_metrics), "Model"))]
+
+# Show table
+print(combined_metrics)
+
+```
+
+```{r}
+class.plot = function(model = NULL, data, train.index = NULL, method, class = NULL,  k = 1, 
+                      prob = 0.5, predict_type = "class", train = TRUE, resolution = 100, add = FALSE, ...) {
+  
+  if (is.null(model) & !(method %in% c("knn", "Bayes")))
+    return("Please type model or select method as knn or Bayes")
+  
+  if (is.null(method)) return("Please type in method")
+  
+  if (method == "naiveBayes" & predict_type != "raw")
+    return("Please change predict_type to 'raw'")
+  
+  if (!is.null(train.index)) {
+    data.tr = data[train.index,]
+    data.te = data[-train.index,]
+  } else {
+    data.tr = data
+    data.te = NULL
+  }
+  
+  if (!is.null(class)) {
+    cl1 <- data.tr[, class]
+    cl2 <- data.te[, class]
+  } else {
+    cl1 <- data.tr[, 3]
+    cl2 <- data.te[, 3]
+  }
+  
+  if (abs(nrow(data) - nrow(data.tr)) > 1) {
+    if (length(unique(cl1)) != length(unique(cl2))) {
+      return("training and test sets class numbers do not match")
+    }
+  }
+  
+  # Plot title logic
+  plot.title = paste(k, "-NN classification for ", sep = "")
+  if (method == "logistic" & length(unique(cl1)) <= 2) {
+    plot.title = paste("Logistic regression classification for ", sep = "")
+  } else if (method == "logistic" & length(unique(cl1)) > 2) {
+    plot.title = paste("Logistic regression classification for ")
+  } else if (method == "spline") {
+    plot.title = paste("Logistic (1 knot spline) classification for ")
+  } else if (method == "spline2") {
+    plot.title = paste("Logistic (2 knot spline) classification for ")
+  } else if (method == "GAM") {
+    plot.title = paste("GAM classification for ")
+  } else if (method == "lda") {
+    plot.title = paste("LDA classification for ")
+  } else if (method == "rf") {
+    plot.title = paste("Random Forest classification for ")
+  } else if (method == "qda") {
+    plot.title = paste("QDA classification for ")
+  } else if (method == "naiveBayes") {
+    plot.title = paste("Naive Bayes classification for ", sep = "")
+  }
+
+  # Plotting the data
+  if (!add) {
+    if (train) {
+      plot(data.tr[, 1:2], col = as.integer(cl1) + 1L, pch = as.integer(cl1) + 1L,
+           main = paste(plot.title, "training data", sep = ""), ...)
+    } else {
+      plot(data.te[, 1:2], col = as.integer(cl2) + 1L, pch = as.integer(cl2) + 1L,
+           main = paste(plot.title, "test data", sep = ""), ...)
+    }
+  }
+
+  r <- sapply(data[, 1:2], range, na.rm = TRUE)
+  xs <- seq(r[1, 1], r[2, 1], length.out = resolution)
+  ys <- seq(r[1, 2], r[2, 2], length.out = resolution)
+  g <- cbind(rep(xs, each = resolution), rep(ys, time = resolution))
+  colnames(g) <- colnames(r)
+  g <- as.data.frame(g)
+
+  if (method == "knn") {
+    p = knn(data.tr[, 1:2], g, data.tr[, 3], k = k)
+  } else if (method %in% c("logistic", "spline", "spline2", "GAM") & length(unique(cl1)) <= 2) {
+    p = predict(model, g, type = predict_type)
+    p = ifelse(p > prob, 1, 0)
+  } else if (method == "naiveBayes") {
+    p = predict(model, g, type = predict_type)
+    p = apply(p, 1, which.max)
+  } else if (method == "Bayes") {
+    p = model(g)
+  } else {
+    p = predict(model, g)
+  }
+
+  if (is.list(p)) p <- p$class
+  p <- as.factor(p)
+  z <- matrix(as.integer(p), nrow = resolution, byrow = TRUE)
+  
+  contour(xs, ys, z, add = TRUE, drawlabels = FALSE,
+          lwd = 2, levels = (1:(length(unique(data[, 3])) - 1)) + .5, ...)
+  points(g, col = as.integer(p) + 1L, pch = ".")
+  invisible(z)
+}
+
+
+
+data <- diabetes.complete[, c("Glucose", "BMI", "Outcome")]
+data$Outcome <- factor(data$Outcome, levels = c(0, 1), labels = c("No Diabetes", "Diabetes"))
+
+
+logit.model <- glm(Outcome ~ ., data = data, family = binomial)
+class.plot(
+  model = logit.model,
+  data = data,
+  train.index = seq_len(nrow(data)),
+  method = "logistic",
+  class = "Outcome",
+  predict_type = "response", 
+  resolution = 100
+)
+
+gam.model <- gam(
+  Outcome ~ s(Glucose) + s(BMI),
+  family = binomial,
+  data = data
+)
+class.plot(
+  model = gam.model,
+  data = data,
+  train.index = seq_len(nrow(data)),
+  method = "GAM",
+  class = "Outcome",
+  predict_type = "response", 
+  resolution = 100
+)
+
+# 1-Knot Spline Model
+bs.model <- glm(
+  Outcome ~ bs(Glucose, df = 1, degree = 3) + bs(BMI, df = 1, degree = 3),
+  family = binomial,
+  data = data
+)
+class.plot(
+  model = bs.model,
+  data = data,
+  train.index = seq_len(nrow(data)),
+  method = "spline",
+  class = "Outcome",
+  predict_type = "response", 
+  resolution = 100
+)
+
+# 2-Knot Spline Model
+bs.model2 <- glm(
+  Outcome ~ bs(Glucose, df = 2, degree = 3) + bs(BMI, df = 2, degree = 3),
+  family = binomial,
+  data = data
+)
+class.plot(
+  model = bs.model2,
+  data = data,
+  train.index = seq_len(nrow(data)),
+  method = "spline2",
+  class = "Outcome",
+  predict_type = "response", 
+  resolution = 100
+)
+
+
+# Use `class.plot` to visualize the decision boundary for kNN
+class.plot(
+  data = data,
+  train.index = seq_len(nrow(data)),  # Use all data for training
+  method = "knn",
+  class = "Outcome",
+  k = 5,  # Number of neighbors
+  resolution = 100
+)
+
+qda.model <- qda(Outcome ~ ., data = data)
+class.plot(
+  model = qda.model,       # QDA model
+  data = data,             # Full dataset
+  train.index = seq_len(nrow(data)),  # Use all data for training
+  method = "qda",          # Specify method as QDA
+  class = "Outcome",       # Target variable
+  resolution = 100         # Resolution of the decision boundary
+)
+
+rf.model <- randomForest(Outcome ~ ., data = data, ntree = 500, importance = TRUE)
+class.plot(
+  model = rf.model,       
+  data = data,             # Full dataset
+  train.index = seq_len(nrow(data)),  # Use all data for training
+  method = "rf",          # ~ QDA
+  class = "Outcome",       # Target variable
+  resolution = 100         # Resolution of the decision boundary
+)
+
+```
+
+
+# Gini Index
+
+```{r}
+# Make sure required libraries are loaded
+library(randomForest)
+library(ggplot2)
+
+# Train on the full dataset
+diabetes.complete$Outcome <- factor(diabetes.complete$Outcome, levels = c(0, 1))
+
+rf_full <- randomForest(Outcome ~ ., data = diabetes.complete, ntree = 500, importance = TRUE)
+
+# Extract Gini importance
+gini_importance <- importance(rf_full, type = 2)  # type = 2 is MeanDecreaseGini
+gini_df <- data.frame(Feature = rownames(gini_importance),
+                      Gini = gini_importance[, "MeanDecreaseGini"])
+
+# Sort by importance
+gini_df <- gini_df[order(gini_df$Gini, decreasing = TRUE), ]
+
+# Plot
+ggplot(gini_df, aes(x = reorder(Feature, Gini), y = Gini)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Variable Importance (Gini Index)",
+       x = "Feature",
+       y = "Mean Decrease in Gini") +
+  theme_minimal()
+
+```
+
+
