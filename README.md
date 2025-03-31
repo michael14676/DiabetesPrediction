@@ -7,13 +7,13 @@ This repository contains code and documentation for a project focused on predict
 - **Dataset:** [Pima Indians Diabetes Database](https://www.kaggle.com/datasets/uciml/pima-indians-diabetes-database)
 - **Objective:** Predict the presence of diabetes in female patients based on diagnostic measurements.
 - **Models Used:**
-  - Classical: Logistic Regression, Linear Regression (for exploration), Polynomial Regression, Splines, Generalized Additive Models (GAMs)
+  - Classical: Logistic Regression, Splines, Generalized Additive Models (GAMs)
   - Tree-based: Decision Trees, Bagging, Random Forests, Gradient Boosting
 
 ## Highlights
 
-- Comparative analysis of model performance using metrics such as accuracy, ROC-AUC, precision, and recall
-- Application of feature engineering techniques, including polynomial terms and splines
+- Comparative analysis of model performance using metrics such as accuracy, ROC-AUC, and F1 score
+- Application of feature engineering techniques, including feature interaction terms and splines
 
 ## Repository Structure
 
