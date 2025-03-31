@@ -17,7 +17,7 @@ This repository contains code and documentation for a project focused on predict
 
 ## Repository Structure
 
-- `notebooks/` – R script for data preprocessing, modeling, and evaluation
+- `diabetes_prediction.Rmd` – R script for data preprocessing, modeling, and evaluation
 - `poster.pdf` – Poster summarizing the project at a glance
 - `writeup.pdf` – Full project report including methods, results, and conclusions
 
